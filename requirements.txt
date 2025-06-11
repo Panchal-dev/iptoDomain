@@ -1,12 +1,5 @@
 requests==2.31.0
 beautifulsoup4==4.12.3
-python-telegram-bot==21.6.2
+python-telegram-bot==21.6
 flask==2.3.3
 gunicorn==22.0.0
-python-telegram-bot==13.7
-cloudscraper==1.2.71
-beautifulsoup4==4.12.2
-requests==2.31.0
-urllib3==1.26.18
-six==1.16.0
-gunicorn==21.2.0
