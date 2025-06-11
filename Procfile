@@ -1,1 +1,1 @@
-web: gunicorn iplookup:app --timeout 60
+web: python iplookup.py
