@@ -8,7 +8,7 @@ import telebot
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
-from flask import Flask
+from flask import Flask, request
 import logging
 from datetime import datetime
 import tempfile
@@ -37,13 +37,15 @@ USER_AGENTS = [
 ]
 REQUEST_TIMEOUT = 10
 MAX_RETRIES = 2
-REQUESTS_PER_SECOND = 0.5  # Reduced for Railway free tier
+REQUESTS_PER_SECOND = 0.5
 REVIP_API_URL = "https://api.revip.workers.dev/"
+NEW_REVIP_API_URL = "https://api.revip.workers.dev/"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 ALLOWED_IDS = list(map(int, os.environ.get("ALLOWED_IDS", "").split(","))) if os.environ.get("ALLOWED_IDS") else []
+PORT = int(os.environ.get("PORT", 8080))
 
-# Flask app for webhook
+# Flask app
 app = Flask(__name__)
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
@@ -201,12 +203,38 @@ class RevIPSource(DomainSource):
             logger.error(f"Error fetching from RevIP for IP {ip}: {e}")
         return domains
 
+# New RevIP API Source
+class NewRevIPSource(DomainSource):
+    def __init__(self):
+        super().__init__("NewRevIP")
+
+    def fetch(self, ip):
+        domains = set()
+        try:
+            response = self.post(
+                NEW_REVIP_API_URL,
+                headers={'Content-Type': 'application/json'},
+                json={'ips': [ip]},
+                timeout=REQUEST_TIMEOUT
+            )
+            if response:
+                data = response.json()
+                result = data.get(ip, {})
+                if result.get('status') == 'success':
+                    domains.update(result.get('domains', []))
+                else:
+                    logger.warning(f"NewRevIP API error for IP {ip}: {result.get('message', 'Unknown error')}")
+        except requests.RequestException as e:
+            logger.error(f"Error fetching from NewRevIP for IP {ip}: {e}")
+        return domains
+
 # Get scrapers
 def get_scrapers():
     return [
         RapidDNSSource(),
         YouGetSignalSource(),
-        RevIPSource()
+        RevIPSource(),
+        NewRevIPSource()
     ]
 
 # Process IPs from file
@@ -239,7 +267,6 @@ def split_file(file_path, max_size=MAX_FILE_SIZE):
         part_number = 1
         current_file = None
         current_size = 0
-        line_buffer = []
 
         with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -253,7 +280,6 @@ def split_file(file_path, max_size=MAX_FILE_SIZE):
                     current_file = open(f"{base_name}_part{part_number}.txt", 'w', encoding='utf-8')
                 current_file.write(line)
                 current_size += line_size
-                line_buffer.append(line)
 
         if current_file:
             current_file.close()
@@ -312,7 +338,7 @@ class IPLookup:
 
         all_domains = set()
         try:
-            with ThreadPoolExecutor(max_workers=3) as executor:  # Reduced for Railway
+            with ThreadPoolExecutor(max_workers=2) as executor:  # Reduced for Railway
                 futures = [executor.submit(self.process_ip, ip) for ip in ips]
                 for future in as_completed(futures):
                     try:
@@ -329,7 +355,7 @@ class IPLookup:
                 return False, "Failed to save domains to file"
 
             output_files = split_file(output_file)
-            return True, output_files
+            return True, (output_files, len(all_domains))
         except Exception as e:
             logger.error(f"Error running IP lookup: {e}")
             return False, str(e)
@@ -413,9 +439,9 @@ def handle_document(message):
             return
 
         # Send output files
-        output_files = result
+        output_files, domain_count = result
         bot.edit_message_text(
-            f"✅ Found {len(all_domains)} domains!\n\n📤 Sending output file(s)...",
+            f"✅ Found {domain_count} domains!\n\n📤 Sending output file(s)...",
             chat_id, processing_message.message_id
         )
 
@@ -472,20 +498,29 @@ def webhook():
         logger.error(f"Webhook error: {e}")
         return '', 200
 
-# Set webhook
+# Set webhook with retries
 def set_webhook():
-    railway_domain = os.environ.get('RAILWAY_PUBLIC_DOMAIN')
+    railway_domain = os.getenv('RAILWAY_PUBLIC_DOMAIN')
     if not railway_domain:
         logger.error("RAILWAY_PUBLIC_DOMAIN not set")
         raise ValueError("RAILWAY_PUBLIC_DOMAIN not set")
     webhook_url = f"https://{railway_domain}/telegram"
-    bot.set_webhook()
-    time.sleep(1)
-    bot.set_webhook(url=webhook_url)
-    logger.info(f"Webhook set to: {webhook_url}")
+    for attempt in range(3):
+        try:
+            bot.set_webhook(url=webhook_url)
+            logger.info(f"Webhook set to: {webhook_url}")
+            return
+        except Exception as e:
+            logger.error(f"Webhook attempt {attempt + 1} failed: {e}")
+            time.sleep(2 ** attempt)
+    logger.error("Failed to set webhook after 3 attempts")
+    raise Exception("Webhook setup failed")
 
 if __name__ == "__main__":
-    set_webhook()
-    port = int(os.environ.get("PORT", 8000))
-    logger.info(f"Starting Flask app on port {port}")
-    app.run(host="0.0.0.0", port=port)
+    try:
+        set_webhook()
+        logger.info(f"Starting Flask app on port {PORT}")
+        app.run(host="0.0.0.0", port=PORT)
+    except Exception as e:
+        logger.error(f"Startup error: {e}")
+        raise
