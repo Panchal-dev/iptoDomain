@@ -13,6 +13,8 @@ import logging
 from datetime import datetime
 import tempfile
 import shutil
+import re
+from queue import Queue
 
 # Suppress SSL warnings
 requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
@@ -37,38 +39,25 @@ USER_AGENTS = [
 ]
 REQUEST_TIMEOUT = 10
 MAX_RETRIES = 2
-REQUESTS_PER_SECOND = 0.5
 REVIP_API_URL = "https://api.revip.workers.dev/"
 NEW_REVIP_API_URL = "https://api.revip.workers.dev/"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 ALLOWED_IDS = list(map(int, os.environ.get("ALLOWED_IDS", "").split(","))) if os.environ.get("ALLOWED_IDS") else []
 PORT = int(os.environ.get("PORT", 8080))
+GROUP_ID = -1002872150618  # Group ID
+IPS_TOPIC_ID = 2  # Replace with actual "IPS" topic thread ID
+IPS_OP_TOPIC_ID = 3  # Replace with actual "IPS OP" topic thread ID
 
 # Flask app
 app = Flask(__name__)
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
-# Rate Limiter
-class RateLimiter:
-    def __init__(self, requests_per_second: float):
-        self.delay = 1.0 / requests_per_second
-        self.last_request = 0
-        self._lock = Lock()
-
-    def acquire(self):
-        with self._lock:
-            now = time.time()
-            if now - self.last_request < self.delay:
-                time.sleep(self.delay - (now - self.last_request))
-            self.last_request = time.time()
-
 # Request Handler
 class RequestHandler:
-    def __init__(self):
-        self.session = requests.Session()
+    def __init__(self, session):
+        self.session = session
         self.session.verify = False
-        self.rate_limiter = RateLimiter(REQUESTS_PER_SECOND)
 
     def _get_headers(self):
         headers = HEADERS.copy()
@@ -76,7 +65,6 @@ class RequestHandler:
         return headers
 
     def get(self, url, timeout=REQUEST_TIMEOUT):
-        self.rate_limiter.acquire()
         for attempt in range(MAX_RETRIES + 1):
             try:
                 response = self.session.get(url, timeout=timeout, headers=self._get_headers())
@@ -90,7 +78,6 @@ class RequestHandler:
         return None
 
     def post(self, url, data=None, json=None, timeout=REQUEST_TIMEOUT):
-        self.rate_limiter.acquire()
         for attempt in range(MAX_RETRIES + 1):
             try:
                 response = self.session.post(url, data=data, json=json, timeout=timeout, headers=self._get_headers())
@@ -103,25 +90,19 @@ class RequestHandler:
                 time.sleep(2 ** attempt)
         return None
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.session.close()
-
 # Domain Source base class
-class DomainSource(RequestHandler):
-    def __init__(self, name):
-        super().__init__()
+class DomainSource:
+    def __init__(self, name, session):
         self.name = name
+        self.handler = RequestHandler(session)
 
     def fetch(self, ip):
         raise NotImplementedError
 
 # RapidDNS Source
 class RapidDNSSource(DomainSource):
-    def __init__(self):
-        super().__init__("RapidDNS")
+    def __init__(self, session):
+        super().__init__("RapidDNS", session)
 
     def _extract_domains_from_page(self, soup):
         domains = set()
@@ -148,7 +129,7 @@ class RapidDNSSource(DomainSource):
     def fetch(self, ip):
         domains = set()
         try:
-            response = self.get(f"https://rapiddns.io/sameip/{ip}")
+            response = self.handler.get(f"https://rapiddns.io/sameip/{ip}")
             if response:
                 soup = BeautifulSoup(response.content, 'html.parser')
                 domains.update(self._extract_domains_from_page(soup))
@@ -156,7 +137,7 @@ class RapidDNSSource(DomainSource):
                 if total_results > 100:
                     total_pages = math.ceil(total_results / 100)
                     for page in range(2, total_pages + 1):
-                        response = self.get(f"https://rapiddns.io/sameip/{ip}?page={page}")
+                        response = self.handler.get(f"https://rapiddns.io/sameip/{ip}?page={page}")
                         if response:
                             soup = BeautifulSoup(response.content, 'html.parser')
                             domains.update(self._extract_domains_from_page(soup))
@@ -166,14 +147,14 @@ class RapidDNSSource(DomainSource):
 
 # YouGetSignal Source
 class YouGetSignalSource(DomainSource):
-    def __init__(self):
-        super().__init__("YouGetSignal")
+    def __init__(self, session):
+        super().__init__("YouGetSignal", session)
 
     def fetch(self, ip):
         domains = set()
         try:
             data = {'remoteAddress': ip, 'key': '', '_': ''}
-            response = self.post("https://domains.yougetsignal.com/domains.php", data=data)
+            response = self.handler.post("https://domains.yougetsignal.com/domains.php", data=data)
             if response and response.json().get("status") == "Success":
                 domains.update(
                     domain[0] for domain in response.json().get("domainArray", [])
@@ -185,13 +166,13 @@ class YouGetSignalSource(DomainSource):
 
 # RevIP Source
 class RevIPSource(DomainSource):
-    def __init__(self):
-        super().__init__("RevIP")
+    def __init__(self, session):
+        super().__init__("RevIP", session)
 
     def fetch(self, ip):
         domains = set()
         try:
-            response = self.post(REVIP_API_URL, json={"ips": [ip]})
+            response = self.handler.post(REVIP_API_URL, json={"ips": [ip]})
             if response:
                 data = response.json()
                 result = data.get(ip, {})
@@ -205,13 +186,13 @@ class RevIPSource(DomainSource):
 
 # New RevIP API Source
 class NewRevIPSource(DomainSource):
-    def __init__(self):
-        super().__init__("NewRevIP")
+    def __init__(self, session):
+        super().__init__("NewRevIP", session)
 
     def fetch(self, ip):
         domains = set()
         try:
-            response = self.post(
+            response = self.handler.post(
                 NEW_REVIP_API_URL,
                 headers={'Content-Type': 'application/json'},
                 json={'ips': [ip]},
@@ -229,12 +210,12 @@ class NewRevIPSource(DomainSource):
         return domains
 
 # Get scrapers
-def get_scrapers():
+def get_scrapers(session):
     return [
-        RapidDNSSource(),
-        YouGetSignalSource(),
-        RevIPSource(),
-        NewRevIPSource()
+        RapidDNSSource(session),
+        YouGetSignalSource(session),
+        RevIPSource(session),
+        NewRevIPSource(session)
     ]
 
 # Process IPs from file
@@ -296,7 +277,7 @@ def split_file(file_path, max_size=MAX_FILE_SIZE):
 # IP Lookup class
 class IPLookup:
     def __init__(self):
-        self.scrapers = get_scrapers()
+        pass  # Session will be passed per file
 
     def _fetch_from_source(self, source, ip):
         try:
@@ -317,12 +298,12 @@ class IPLookup:
                 return False
         return True
 
-    def process_ip(self, ip):
+    def process_ip(self, ip, scrapers):
         try:
-            with ThreadPoolExecutor(max_workers=len(self.scrapers)) as executor:
+            with ThreadPoolExecutor(max_workers=len(scrapers)) as executor:
                 futures = [
                     executor.submit(self._fetch_from_source, source, ip)
-                    for source in self.scrapers
+                    for source in scrapers
                 ]
                 results = [f.result() for f in as_completed(futures)]
             domains = set().union(*results) if results else set()
@@ -336,10 +317,13 @@ class IPLookup:
         if not ips:
             return False, "No valid IPs provided"
 
-        all_domains = set()
+        # Create a new session for this file
+        session = requests.Session()
         try:
+            all_domains = set()
+            scrapers = get_scrapers(session)
             with ThreadPoolExecutor(max_workers=2) as executor:  # Reduced for Railway
-                futures = [executor.submit(self.process_ip, ip) for ip in ips]
+                futures = [executor.submit(self.process_ip, ip, scrapers) for ip in ips]
                 for future in as_completed(futures):
                     try:
                         domains = future.result()
@@ -359,52 +343,70 @@ class IPLookup:
         except Exception as e:
             logger.error(f"Error running IP lookup: {e}")
             return False, str(e)
+        finally:
+            # Close the session
+            session.close()
+            logger.info("Closed requests session for file processing")
 
-# User state
-user_state = {}  # {chat_id: {'step': str, 'processing': bool}}
+# Processing queue
+processing_queue = Queue()
+processing_lock = Lock()
+processing_active = False
 
-# Telegram bot handlers
-@bot.message_handler(commands=['start'])
-def handle_start(message):
+# Process queue in background
+def process_queue():
+    global processing_active
+    while True:
+        if processing_queue.empty():
+            time.sleep(1)
+            continue
+
+        with processing_lock:
+            if processing_active:
+                time.sleep(1)
+                continue
+            processing_active = True
+
+        try:
+            message = processing_queue.get()
+            handle_file_message(message)
+        except Exception as e:
+            logger.error(f"Error processing queue item: {e}")
+        finally:
+            with processing_lock:
+                processing_active = False
+            processing_queue.task_done()
+
+# Handle file message
+def handle_file_message(message):
     chat_id = message.chat.id
-    if chat_id not in ALLOWED_IDS:
-        bot.reply_to(message, "🚫 Unauthorized access!")
-        logger.info(f"Unauthorized access by chat_id {chat_id}")
+    thread_id = message.message_thread_id
+    file_name = message.document.file_name
+
+    # Validate group and topic
+    if chat_id != GROUP_ID or thread_id != IPS_TOPIC_ID:
         return
 
-    user_state[chat_id] = {'step': 'awaiting_file', 'processing': False}
-    bot.reply_to(
-        message,
-        "🎯 Welcome to IP Lookup Bot!\n\n"
-        "📤 Please upload a `.txt` file containing IPs or CIDRs (one per line).\n"
-        "💡 Example:\n```\n192.168.1.1\n10.0.0.0/24\n```\n"
-        "❌ No other input is needed."
-    )
-    logger.info(f"User {chat_id} started bot")
-
-@bot.message_handler(content_types=['document'])
-def handle_document(message):
-    chat_id = message.chat.id
-    if chat_id not in ALLOWED_IDS:
-        bot.reply_to(message, "🚫 Unauthorized access!")
-        logger.info(f"Unauthorized access by chat_id {chat_id}")
+    # Validate file name
+    match = re.match(r'ips_batch_(\d+)\.txt', file_name)
+    if not match:
+        bot.send_message(
+            chat_id,
+            f"❌ Invalid file name: {file_name}. Expected 'ips_batch_N.txt'.",
+            message_thread_id=IPS_OP_TOPIC_ID
+        )
         return
 
-    if chat_id not in user_state or user_state[chat_id]['step'] != 'awaiting_file':
-        bot.reply_to(message, "❌ Please start with /start.")
-        return
-
-    if user_state[chat_id]['processing']:
-        bot.reply_to(message, "⏳ Already processing a file. Please wait.")
-        return
-
-    if not message.document.file_name.endswith('.txt'):
-        bot.reply_to(message, "❌ Please upload a `.txt` file.")
-        return
+    batch_number = match.group(1)
+    output_file_name = f"ips_op_{batch_number}.txt"
 
     try:
-        user_state[chat_id]['processing'] = True
-        processing_message = bot.reply_to(message, "⏳ Downloading and processing your file...")
+        # Notify processing start
+        processing_message = bot.send_message(
+            chat_id,
+            f"⏳ Processing {file_name}...",
+            message_thread_id=IPS_OP_TOPIC_ID
+        )
 
         # Download file
         file_info = bot.get_file(message.document.file_id)
@@ -420,20 +422,28 @@ def handle_document(message):
         # Process IPs
         ips = process_file(temp_file_path)
         if not ips:
-            bot.edit_message_text("❌ No valid IPs or CIDRs found in the file.", chat_id, processing_message.message_id)
-            user_state[chat_id]['processing'] = False
+            bot.edit_message_text(
+                f"❌ No valid IPs or CIDRs found in {file_name}.",
+                chat_id,
+                processing_message.message_id,
+                message_thread_id=IPS_OP_TOPIC_ID
+            )
             os.unlink(temp_file_path)
             return
 
         # Run IP lookup
         output_dir = tempfile.mkdtemp()
-        output_file = os.path.join(output_dir, f"domains_{chat_id}_{int(time.time())}.txt")
+        output_file = os.path.join(output_dir, output_file_name)
         iplookup = IPLookup()
         success, result = iplookup.run(ips, output_file)
 
         if not success:
-            bot.edit_message_text(f"❌ Error: {result}", chat_id, processing_message.message_id)
-            user_state[chat_id]['processing'] = False
+            bot.edit_message_text(
+                f"❌ Error processing {file_name}: {result}",
+                chat_id,
+                processing_message.message_id,
+                message_thread_id=IPS_OP_TOPIC_ID
+            )
             shutil.rmtree(output_dir, ignore_errors=True)
             os.unlink(temp_file_path)
             return
@@ -441,31 +451,34 @@ def handle_document(message):
         # Send output files
         output_files, domain_count = result
         bot.edit_message_text(
-            f"✅ Found {domain_count} domains!\n\n📤 Sending output file(s)...",
-            chat_id, processing_message.message_id
+            f"✅ Found {domain_count} domains for {file_name}!\n\n📤 Sending {output_file_name}...",
+            chat_id,
+            processing_message.message_id,
+            message_thread_id=IPS_OP_TOPIC_ID
         )
 
         for output_file in output_files:
             with open(output_file, 'rb') as f:
-                bot.send_document(chat_id, f, caption="Domains found (one per line).")
-
-        bot.send_message(
-            chat_id,
-            "🎉 Processing complete!\n\n🔄 Upload another `.txt` file or use /start to begin again."
-        )
+                bot.send_document(
+                    chat_id,
+                    f,
+                    filename=output_file_name,
+                    message_thread_id=IPS_OP_TOPIC_ID,
+                    caption=f"Domains found for {file_name} (one per line)."
+                )
 
         # Cleanup
-        user_state[chat_id]['processing'] = False
         shutil.rmtree(output_dir, ignore_errors=True)
         os.unlink(temp_file_path)
 
     except Exception as e:
-        logger.error(f"Error handling document for chat_id {chat_id}: {e}")
+        logger.error(f"Error processing {file_name}: {e}")
         bot.edit_message_text(
-            f"❌ An unexpected error occurred: {str(e)}\n\n🔄 Please try again with /start.",
-            chat_id, processing_message.message_id
+            f"❌ Failed to process {file_name}: {str(e)}",
+            chat_id,
+            processing_message.message_id,
+            message_thread_id=IPS_OP_TOPIC_ID
         )
-        user_state[chat_id]['processing'] = False
         if 'temp_file_path' in locals():
             try:
                 os.unlink(temp_file_path)
@@ -474,18 +487,19 @@ def handle_document(message):
         if 'output_dir' in locals():
             shutil.rmtree(output_dir, ignore_errors=True)
 
-@bot.message_handler(commands=['cancel'])
-def handle_cancel(message):
-    chat_id = message.chat.id
-    if chat_id not in ALLOWED_IDS:
-        bot.reply_to(message, "🚫 Unauthorized access!")
-        return
+# Telegram bot handler for documents
+@bot.message_handler(content_types=['document'])
+def handle_document(message):
+    if message.chat.id == GROUP_ID:
+        processing_queue.put(message)
+        logger.info(f"Added {message.document.file_name} to processing queue")
 
-    if chat_id in user_state and user_state[chat_id]['processing']:
-        user_state[chat_id]['processing'] = False
-        bot.reply_to(message, "✅ Operation cancelled.\n\n🔄 Start again with /start.")
-    else:
-        bot.reply_to(message, "ℹ️ No active operation to cancel.\n\n🚀 Use /start to begin.")
+# Start queue processing thread
+def start_queue_thread():
+    from threading import Thread
+    queue_thread = Thread(target=process_queue, daemon=True)
+    queue_thread.start()
+    logger.info("Started queue processing thread")
 
 # Webhook route
 @app.route('/telegram', methods=['POST'])
@@ -519,6 +533,7 @@ def set_webhook():
 if __name__ == "__main__":
     try:
         set_webhook()
+        start_queue_thread()
         logger.info(f"Starting Flask app on port {PORT}")
         app.run(host="0.0.0.0", port=PORT)
     except Exception as e:
