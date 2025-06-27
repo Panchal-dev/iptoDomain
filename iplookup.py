@@ -10,6 +10,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from io import BytesIO
 import threading
+import urllib3
+
+# Suppress InsecureRequestWarning
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Setup logging
 logging.basicConfig(
@@ -246,7 +250,7 @@ def check_status(message):
 @bot.message_handler(commands=['cancel'])
 def cancel_processing(message):
     chat_id = message.chat.id
-    if processing_status["is_running"] and processing_status["chat_id"] == chat_id:
+    if processing_status["is_running"] and processing_status["chatадид"] == chat_id:
         if processing_status["cancel_event"]:
             processing_status["cancel_event"].set()
             bot.reply_to(message, "🛑 Processing cancelled. Please wait a moment.")
@@ -304,7 +308,7 @@ def handle_text(message):
     bot.send_document(
         chat_id,
         document=output_buffer,
-        file_name="ip_lookup_results.txt",
+        filename="ip_lookup_results.txt",
         caption="Domains found (one per line)."
     )
     processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
@@ -358,7 +362,7 @@ def handle_document(message):
         bot.send_document(
             chat_id,
             document=output_buffer,
-            file_name=f"ip_lookup_results_{file_name}",
+            filename=f"ip_lookup_results_{file_name}",
             caption=f"Domains found for {file_name} (one per line)."
         )
         processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
