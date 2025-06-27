@@ -7,14 +7,11 @@ import requests
 import telebot
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-from flask import Flask, request
 import logging
-from datetime import datetime
 import tempfile
 import shutil
 import re
-from queue import Queue
+from io import BytesIO
 
 # Suppress SSL warnings
 requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
@@ -23,7 +20,7 @@ requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("iplookup.log"), logging.StreamHandler()]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
@@ -42,16 +39,6 @@ MAX_RETRIES = 2
 REVIP_API_URL = "https://api.revip.workers.dev/"
 NEW_REVIP_API_URL = "https://api.revip.workers.dev/"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
-ALLOWED_IDS = list(map(int, os.environ.get("ALLOWED_IDS", "").split(","))) if os.environ.get("ALLOWED_IDS") else []
-PORT = int(os.environ.get("PORT", 8080))
-GROUP_ID = -1002872150618  # Group ID
-IPS_TOPIC_ID = 2  # Replace with actual "IPS" topic thread ID
-IPS_OP_TOPIC_ID = 3  # Replace with actual "IPS OP" topic thread ID
-
-# Flask app
-app = Flask(__name__)
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
 # Request Handler
 class RequestHandler:
@@ -218,66 +205,32 @@ def get_scrapers(session):
         NewRevIPSource(session)
     ]
 
-# Process IPs from file
-def process_file(file_path):
+# Process IPs from file content or text
+def process_input(input_data):
     ips = []
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line:
+        lines = input_data.splitlines() if isinstance(input_data, str) else input_data.read().decode('utf-8').splitlines()
+        for line in lines:
+            line = line.strip()
+            if line:
+                try:
+                    ipaddress.ip_address(line)
+                    ips.append(line)
+                except ValueError:
                     try:
-                        ipaddress.ip_address(line)
-                        ips.append(line)
+                        network = ipaddress.ip_network(line, strict=False)
+                        ips.extend(str(ip) for ip in network.hosts())
                     except ValueError:
-                        try:
-                            network = ipaddress.ip_network(line, strict=False)
-                            ips.extend(str(ip) for ip in network.hosts())
-                        except ValueError:
-                            logger.warning(f"Invalid IP or CIDR: {line}")
+                        logger.warning(f"Invalid IP or CIDR: {line}")
         return list(set(ips))
     except Exception as e:
-        logger.error(f"Error reading file {file_path}: {e}")
+        logger.error(f"Error processing input: {e}")
         return []
-
-# Split large file into parts
-def split_file(file_path, max_size=MAX_FILE_SIZE):
-    output_files = []
-    try:
-        base_name = os.path.splitext(file_path)[0]
-        part_number = 1
-        current_file = None
-        current_size = 0
-
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line_size = len(line.encode('utf-8'))
-                if current_size + line_size > max_size or current_file is None:
-                    if current_file:
-                        current_file.close()
-                        output_files.append(f"{base_name}_part{part_number}.txt")
-                        part_number += 1
-                        current_size = 0
-                    current_file = open(f"{base_name}_part{part_number}.txt", 'w', encoding='utf-8')
-                current_file.write(line)
-                current_size += line_size
-
-        if current_file:
-            current_file.close()
-            output_files.append(f"{base_name}_part{part_number}.txt")
-
-        if not output_files:
-            output_files.append(file_path)
-
-        return output_files
-    except Exception as e:
-        logger.error(f"Error splitting file {file_path}: {e}")
-        return [file_path]
 
 # IP Lookup class
 class IPLookup:
     def __init__(self):
-        pass  # Session will be passed per file
+        pass
 
     def _fetch_from_source(self, source, ip):
         try:
@@ -288,15 +241,15 @@ class IPLookup:
             logger.error(f"Error fetching from {source.name} for IP {ip}: {e}")
             return set()
 
-    def _save_domains(self, domains, output_file):
+    def _save_domains_to_buffer(self, domains):
         if domains:
             try:
-                with open(output_file, "w", encoding="utf-8") as f:
-                    f.write("\n".join(sorted(domains)) + "\n")
+                output = "\n".join(sorted(domains)) + "\n"
+                return BytesIO(output.encode('utf-8'))
             except Exception as e:
-                logger.error(f"Error saving domains to {output_file}: {e}")
-                return False
-        return True
+                logger.error(f"Error creating output buffer: {e}")
+                return None
+        return None
 
     def process_ip(self, ip, scrapers):
         try:
@@ -313,16 +266,15 @@ class IPLookup:
             logger.error(f"Error processing IP {ip}: {e}")
             return set()
 
-    def run(self, ips, output_file):
+    def run(self, ips):
         if not ips:
-            return False, "No valid IPs provided"
+            return False, "No valid IPs provided", None
 
-        # Create a new session for this file
         session = requests.Session()
         try:
             all_domains = set()
             scrapers = get_scrapers(session)
-            with ThreadPoolExecutor(max_workers=2) as executor:  # Reduced for Railway
+            with ThreadPoolExecutor(max_workers=2) as executor:
                 futures = [executor.submit(self.process_ip, ip, scrapers) for ip in ips]
                 for future in as_completed(futures):
                     try:
@@ -332,210 +284,112 @@ class IPLookup:
                         logger.error(f"Error in IP processing thread: {e}")
 
             if not all_domains:
-                return False, "No domains found for the provided IPs"
+                return False, "No domains found for the provided IPs", None
 
-            success = self._save_domains(all_domains, output_file)
-            if not success:
-                return False, "Failed to save domains to file"
+            output_buffer = self._save_domains_to_buffer(all_domains)
+            if not output_buffer:
+                return False, "Failed to create output file", None
 
-            output_files = split_file(output_file)
-            return True, (output_files, len(all_domains))
+            return True, f"Found {len(all_domains)} domains", output_buffer
         except Exception as e:
             logger.error(f"Error running IP lookup: {e}")
-            return False, str(e)
+            return False, str(e), None
         finally:
-            # Close the session
             session.close()
-            logger.info("Closed requests session for file processing")
+            logger.info("Closed requests session")
 
-# Processing queue
-processing_queue = Queue()
-processing_lock = Lock()
-processing_active = False
+# Initialize bot
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
-# Process queue in background
-def process_queue():
-    global processing_active
-    while True:
-        if processing_queue.empty():
-            time.sleep(1)
-            continue
-
-        with processing_lock:
-            if processing_active:
-                time.sleep(1)
-                continue
-            processing_active = True
-
-        try:
-            message = processing_queue.get()
-            handle_file_message(message)
-        except Exception as e:
-            logger.error(f"Error processing queue item: {e}")
-        finally:
-            with processing_lock:
-                processing_active = False
-            processing_queue.task_done()
-
-# Handle file message
-def handle_file_message(message):
+# Handle text messages (single IP or CIDR)
+@bot.message_handler(content_types=['text'])
+def handle_text(message):
     chat_id = message.chat.id
-    thread_id = message.message_thread_id
-    file_name = message.document.file_name
-
-    # Validate group and topic
-    if chat_id != GROUP_ID or thread_id != IPS_TOPIC_ID:
-        return
-
-    # Validate file name
-    match = re.match(r'ips_batch_(\d+)\.txt', file_name)
-    if not match:
-        bot.send_message(
-            chat_id,
-            f"❌ Invalid file name: {file_name}. Expected 'ips_batch_N.txt'.",
-            message_thread_id=IPS_OP_TOPIC_ID
-        )
-        return
-
-    batch_number = match.group(1)
-    output_file_name = f"ips_op_{batch_number}.txt"
+    input_text = message.text.strip()
 
     try:
-        # Notify processing start
-        processing_message = bot.send_message(
-            chat_id,
-            f"⏳ Processing {file_name}...",
-            message_thread_id=IPS_OP_TOPIC_ID
-        )
+        # Validate input
+        try:
+            ipaddress.ip_address(input_text)
+            ips = [input_text]
+        except ValueError:
+            try:
+                network = ipaddress.ip_network(input_text, strict=False)
+                ips = [str(ip) for ip in network.hosts()]
+            except ValueError:
+                bot.send_message(chat_id, "❌ Invalid IP or CIDR format. Please provide a valid IP or CIDR.")
+                return
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Error validating input: {str(e)}")
+        return
 
+    # Process IPs
+    processing_message = bot.send_message(chat_id, "⏳ Processing your input...")
+    iplookup = IPLookup()
+    success, result_message, output_buffer = iplookup.run(ips)
+
+    if not success:
+        bot.edit_message_text(result_message, chat_id, processing_message.message_id)
+        return
+
+    # Send output file
+    bot.edit_message_text(result_message + "\n\n📤 Sending results...", chat_id, processing_message.message_id)
+    bot.send_document(
+        chat_id,
+        output_buffer,
+        filename="ip_lookup_results.txt",
+        caption="Domains found (one per line)."
+    )
+
+# Handle document messages (text file with IPs)
+@bot.message_handler(content_types=['document'])
+def handle_document(message):
+    chat_id = message.chat.id
+    file_name = message.document.file_name
+
+    if not file_name.endswith('.txt'):
+        bot.send_message(chat_id, "❌ Please upload a .txt file containing IPs or CIDRs.")
+        return
+
+    try:
         # Download file
         file_info = bot.get_file(message.document.file_id)
         file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_info.file_path}"
         response = requests.get(file_url, timeout=10)
         response.raise_for_status()
 
-        # Save to temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.txt') as temp_file:
-            temp_file.write(response.content)
-            temp_file_path = temp_file.name
-
-        # Process IPs
-        ips = process_file(temp_file_path)
+        # Process file content
+        processing_message = bot.send_message(chat_id, f"⏳ Processing {file_name}...")
+        ips = process_input(response.content)
         if not ips:
-            bot.edit_message_text(
-                f"❌ No valid IPs or CIDRs found in {file_name}.",
-                chat_id,
-                processing_message.message_id,
-                message_thread_id=IPS_OP_TOPIC_ID
-            )
-            os.unlink(temp_file_path)
+            bot.edit_message_text(f"❌ No valid IPs or CIDRs found in {file_name}.", chat_id, processing_message.message_id)
             return
 
         # Run IP lookup
-        output_dir = tempfile.mkdtemp()
-        output_file = os.path.join(output_dir, output_file_name)
         iplookup = IPLookup()
-        success, result = iplookup.run(ips, output_file)
+        success, result_message, output_buffer = iplookup.run(ips)
 
         if not success:
-            bot.edit_message_text(
-                f"❌ Error processing {file_name}: {result}",
-                chat_id,
-                processing_message.message_id,
-                message_thread_id=IPS_OP_TOPIC_ID
-            )
-            shutil.rmtree(output_dir, ignore_errors=True)
-            os.unlink(temp_file_path)
+            bot.edit_message_text(result_message, chat_id, processing_message.message_id)
             return
 
-        # Send output files
-        output_files, domain_count = result
-        bot.edit_message_text(
-            f"✅ Found {domain_count} domains for {file_name}!\n\n📤 Sending {output_file_name}...",
+        # Send output file
+        bot.edit_message_text(result_message + f"\n\n📤 Sending results for {file_name}...", chat_id, processing_message.message_id)
+        bot.send_document(
             chat_id,
-            processing_message.message_id,
-            message_thread_id=IPS_OP_TOPIC_ID
+            output_buffer,
+            filename=f"ip_lookup_results_{file_name}",
+            caption=f"Domains found for {file_name} (one per line)."
         )
-
-        for output_file in output_files:
-            with open(output_file, 'rb') as f:
-                bot.send_document(
-                    chat_id,
-                    f,
-                    filename=output_file_name,
-                    message_thread_id=IPS_OP_TOPIC_ID,
-                    caption=f"Domains found for {file_name} (one per line)."
-                )
-
-        # Cleanup
-        shutil.rmtree(output_dir, ignore_errors=True)
-        os.unlink(temp_file_path)
 
     except Exception as e:
         logger.error(f"Error processing {file_name}: {e}")
-        bot.edit_message_text(
-            f"❌ Failed to process {file_name}: {str(e)}",
-            chat_id,
-            processing_message.message_id,
-            message_thread_id=IPS_OP_TOPIC_ID
-        )
-        if 'temp_file_path' in locals():
-            try:
-                os.unlink(temp_file_path)
-            except:
-                pass
-        if 'output_dir' in locals():
-            shutil.rmtree(output_dir, ignore_errors=True)
-
-# Telegram bot handler for documents
-@bot.message_handler(content_types=['document'])
-def handle_document(message):
-    if message.chat.id == GROUP_ID:
-        processing_queue.put(message)
-        logger.info(f"Added {message.document.file_name} to processing queue")
-
-# Start queue processing thread
-def start_queue_thread():
-    from threading import Thread
-    queue_thread = Thread(target=process_queue, daemon=True)
-    queue_thread.start()
-    logger.info("Started queue processing thread")
-
-# Webhook route
-@app.route('/telegram', methods=['POST'])
-def webhook():
-    try:
-        update = telebot.types.Update.de_json(request.get_json())
-        bot.process_new_updates([update])
-        return '', 200
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return '', 200
-
-# Set webhook with retries
-def set_webhook():
-    railway_domain = os.getenv('RAILWAY_PUBLIC_DOMAIN')
-    if not railway_domain:
-        logger.error("RAILWAY_PUBLIC_DOMAIN not set")
-        raise ValueError("RAILWAY_PUBLIC_DOMAIN not set")
-    webhook_url = f"https://{railway_domain}/telegram"
-    for attempt in range(3):
-        try:
-            bot.set_webhook(url=webhook_url)
-            logger.info(f"Webhook set to: {webhook_url}")
-            return
-        except Exception as e:
-            logger.error(f"Webhook attempt {attempt + 1} failed: {e}")
-            time.sleep(2 ** attempt)
-    logger.error("Failed to set webhook after 3 attempts")
-    raise Exception("Webhook setup failed")
+        bot.edit_message_text(f"❌ Failed to process {file_name}: {str(e)}", chat_id, processing_message.message_id)
 
 if __name__ == "__main__":
     try:
-        set_webhook()
-        start_queue_thread()
-        logger.info(f"Starting Flask app on port {PORT}")
-        app.run(host="0.0.0.0", port=PORT)
+        bot.polling(none_stop=True)
     except Exception as e:
-        logger.error(f"Startup error: {e}")
-        raise
+        logger.error(f"Bot polling error: {e}")
+        time.sleep(5)
+        bot.polling(none_stop=True)
