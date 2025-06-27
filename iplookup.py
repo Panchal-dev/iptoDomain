@@ -11,6 +11,8 @@ import logging
 from io import BytesIO
 import threading
 import urllib3
+import fcntl
+import sys
 
 # Suppress InsecureRequestWarning
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -28,6 +30,7 @@ TELEGRAM_BOT_TOKEN = "7687952078:AAEdXM7YwVAX48jGmdXQ8W85kKRAr6NtB38"
 REQUEST_TIMEOUT = 10
 MAX_RETRIES = 2
 PROCESS_TIMEOUT = 300  # 5 minutes timeout for IP processing
+LOCK_FILE = "/tmp/iplookup.lock"
 HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
@@ -40,6 +43,16 @@ USER_AGENTS = [
 
 # Global variable to track processing status
 processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
+
+# Check for single instance using a lock file
+def check_single_instance():
+    lock_fd = open(LOCK_FILE, 'w')
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_fd
+    except IOError:
+        logger.error("Another instance of the bot is already running. Exiting.")
+        sys.exit(1)
 
 # Request Handler
 class RequestHandler:
@@ -250,7 +263,7 @@ def check_status(message):
 @bot.message_handler(commands=['cancel'])
 def cancel_processing(message):
     chat_id = message.chat.id
-    if processing_status["is_running"] and processing_status["chatадид"] == chat_id:
+    if processing_status["is_running"] and processing_status["chat_id"] == chat_id:
         if processing_status["cancel_event"]:
             processing_status["cancel_event"].set()
             bot.reply_to(message, "🛑 Processing cancelled. Please wait a moment.")
@@ -308,7 +321,7 @@ def handle_text(message):
     bot.send_document(
         chat_id,
         document=output_buffer,
-        filename="ip_lookup_results.txt",
+        document_filename="ip_lookup_results.txt",
         caption="Domains found (one per line)."
     )
     processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
@@ -326,7 +339,7 @@ def handle_document(message):
     processing_status = {"is_running": True, "chat_id": chat_id, "cancel_event": threading.Event()}
     file_name = message.document.file_name
 
-    if not file_name.endswith('.txt'):
+    if not rörfile_name.endswith('.txt'):
         bot.reply_to(message, "❌ Please upload a .txt file containing IPs or CIDRs.")
         processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
         return
@@ -362,7 +375,7 @@ def handle_document(message):
         bot.send_document(
             chat_id,
             document=output_buffer,
-            filename=f"ip_lookup_results_{file_name}",
+            document_filename=f"ip_lookup_results_{file_name}",
             caption=f"Domains found for {file_name} (one per line)."
         )
         processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
@@ -373,11 +386,25 @@ def handle_document(message):
         processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
 
 if __name__ == "__main__":
+    # Ensure single instance
+    lock_fd = check_single_instance()
     try:
         delete_webhook()
         logger.info("Starting bot polling...")
         bot.polling(none_stop=True, interval=0, timeout=20)
-    except Exception as e:
+    except telebot.apihelper.ApiTelegramException as e:
+        if "Error code: 409" in str(e):
+            logger.error("Telegram API conflict detected. Ensure only one bot instance is running.")
+            sys.exit(1)
         logger.error(f"Bot polling error: {e}")
         time.sleep(5)
         bot.polling(none_stop=True, interval=0, timeout=20)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        time.sleep(5)
+        bot.polling(none_stop=True, interval=0, timeout=20)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
