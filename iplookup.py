@@ -13,6 +13,7 @@ import threading
 import urllib3
 import fcntl
 import sys
+import psutil
 
 # Suppress InsecureRequestWarning
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -31,6 +32,8 @@ REQUEST_TIMEOUT = 10
 MAX_RETRIES = 2
 PROCESS_TIMEOUT = 300  # 5 minutes timeout for IP processing
 LOCK_FILE = "/tmp/iplookup.lock"
+POLLING_RETRIES = 3
+POLLING_RETRY_DELAY = 5
 HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
@@ -44,14 +47,26 @@ USER_AGENTS = [
 # Global variable to track processing status
 processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
 
-# Check for single instance using a lock file
+# Check for single instance using lock file and process check
 def check_single_instance():
     lock_fd = open(LOCK_FILE, 'w')
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Additional process check using psutil
+        current_pid = os.getpid()
+        bot_count = 0
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if proc.pid != current_pid and 'python' in proc.name().lower() and 'iplookup.py' in ' '.join(proc.cmdline()):
+                    bot_count += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        if bot_count > 0:
+            logger.error("Multiple bot instances detected via process check. Exiting.")
+            sys.exit(1)
         return lock_fd
     except IOError:
-        logger.error("Another instance of the bot is already running. Exiting.")
+        logger.error("Another instance of the bot is already running (lock file conflict). Exiting.")
         sys.exit(1)
 
 # Request Handler
@@ -318,12 +333,16 @@ def handle_text(message):
 
     bot.edit_message_text(result_message + "\n\n📤 Sending results...", chat_id, processing_message.message_id)
     output_buffer.seek(0)
-    bot.send_document(
-        chat_id,
-        document=output_buffer,
-        document_filename="ip_lookup_results.txt",
-        caption="Domains found (one per line)."
-    )
+    try:
+        bot.send_document(
+            chat_id,
+            document=output_buffer,
+            document_filename="ip_lookup_results.txt",
+            caption="Domains found (one per line)."
+        )
+    except Exception as e:
+        logger.error(f"Error sending document: {e}")
+        bot.edit_message_text(f"❌ Failed to send results: {str(e)}", chat_id, processing_message.message_id)
     processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
 
 # Handle document messages (text file with IPs)
@@ -339,7 +358,7 @@ def handle_document(message):
     processing_status = {"is_running": True, "chat_id": chat_id, "cancel_event": threading.Event()}
     file_name = message.document.file_name
 
-    if not rörfile_name.endswith('.txt'):
+    if not file_name.endswith('.txt'):
         bot.reply_to(message, "❌ Please upload a .txt file containing IPs or CIDRs.")
         processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
         return
@@ -372,12 +391,16 @@ def handle_document(message):
 
         bot.edit_message_text(result_message + f"\n\n📤 Sending results for {file_name}...", chat_id, processing_message.message_id)
         output_buffer.seek(0)
-        bot.send_document(
-            chat_id,
-            document=output_buffer,
-            document_filename=f"ip_lookup_results_{file_name}",
-            caption=f"Domains found for {file_name} (one per line)."
-        )
+        try:
+            bot.send_document(
+                chat_id,
+                document=output_buffer,
+                document_filename=f"ip_lookup_results_{file_name}",
+                caption=f"Domains found for {file_name} (one per line)."
+            )
+        except Exception as e:
+            logger.error(f"Error sending document: {e}")
+            bot.edit_message_text(f"❌ Failed to send results: {str(e)}", chat_id, processing_message.message_id)
         processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
 
     except Exception as e:
@@ -391,18 +414,23 @@ if __name__ == "__main__":
     try:
         delete_webhook()
         logger.info("Starting bot polling...")
-        bot.polling(none_stop=True, interval=0, timeout=20)
-    except telebot.apihelper.ApiTelegramException as e:
-        if "Error code: 409" in str(e):
-            logger.error("Telegram API conflict detected. Ensure only one bot instance is running.")
-            sys.exit(1)
-        logger.error(f"Bot polling error: {e}")
-        time.sleep(5)
-        bot.polling(none_stop=True, interval=0, timeout=20)
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        time.sleep(5)
-        bot.polling(none_stop=True, interval=0, timeout=20)
+        for attempt in range(POLLING_RETRIES):
+            try:
+                bot.polling(none_stop=True, interval=0, timeout=20)
+                break
+            except telebot.apihelper.ApiTelegramException as e:
+                if "Error code: 409" in str(e):
+                    logger.error(f"Telegram API conflict detected (attempt {attempt + 1}/{POLLING_RETRIES}). Retrying in {POLLING_RETRY_DELAY}s...")
+                    time.sleep(POLLING_RETRY_DELAY)
+                    if attempt == POLLING_RETRIES - 1:
+                        logger.error("Max retries reached. Ensure only one bot instance is running.")
+                        sys.exit(1)
+                else:
+                    logger.error(f"Bot polling error: {e}")
+                    time.sleep(POLLING_RETRY_DELAY)
+            except Exception as e:
+                logger.error(f"Unexpected error: {e}")
+                time.sleep(POLLING_RETRY_DELAY)
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         lock_fd.close()
