@@ -202,7 +202,7 @@ class IPLookup:
             return domains
         except Exception as e:
             logger.error(f"Error fetching from {source.name} for IP {ip}: {e}")
-            return set()
+            return set
 
     def _save_domains_to_buffer(self, domains):
         if domains:

@@ -1,1 +1,1 @@
-web: python iplookup.py
+worker: python iplookup.py
