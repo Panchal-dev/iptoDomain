@@ -4,14 +4,12 @@ import math
 import random
 import ipaddress
 import requests
-import telebot
 from bs4 import BeautifulSoup
+import telebot
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from io import BytesIO
 import threading
-import signal
-import sys
 
 # Setup logging
 logging.basicConfig(
@@ -23,6 +21,9 @@ logger = logging.getLogger(__name__)
 
 # Constants
 TELEGRAM_BOT_TOKEN = "7687952078:AAEdXM7YwVAX48jGmdXQ8W85kKRAr6NtB38"
+REQUEST_TIMEOUT = 10
+MAX_RETRIES = 2
+PROCESS_TIMEOUT = 300  # 5 minutes timeout for IP processing
 HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
@@ -32,17 +33,9 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15",
 ]
-REQUEST_TIMEOUT = 10
-MAX_RETRIES = 2
-PROCESS_TIMEOUT = 300  # 5 minutes timeout for IP processing
 
-# Global variables for process control
-current_process = None
-process_lock = threading.Lock()
-cancel_event = threading.Event()
-
-# Suppress SSL warnings
-requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
+# Global variable to track processing status
+processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
 
 # Request Handler
 class RequestHandler:
@@ -52,7 +45,7 @@ class RequestHandler:
 
     def _get_headers(self):
         headers = HEADERS.copy()
-        headers["user-agent"] = random.choice(USER_AGENTS)
+        headers["User-Agent"] = random.choice(USER_AGENTS)
         return headers
 
     def get(self, url, timeout=REQUEST_TIMEOUT):
@@ -68,32 +61,11 @@ class RequestHandler:
                 time.sleep(2 ** attempt)
         return None
 
-    def post(self, url, data=None, timeout=REQUEST_TIMEOUT):
-        for attempt in range(MAX_RETRIES + 1):
-            try:
-                response = self.session.post(url, data=data, timeout=timeout, headers=self._get_headers())
-                response.raise_for_status()
-                return response
-            except requests.RequestException as e:
-                logger.warning(f"POST request failed for {url}: {e}. Attempt {attempt + 1}/{MAX_RETRIES + 1}")
-                if attempt == MAX_RETRIES:
-                    return None
-                time.sleep(2 ** attempt)
-        return None
-
-# Domain Source base class
-class DomainSource:
-    def __init__(self, name, session):
-        self.name = name
-        self.handler = RequestHandler(session)
-
-    def fetch(self, ip):
-        raise NotImplementedError
-
 # RapidDNS Source
-class RapidDNSSource(DomainSource):
+class RapidDNSSource:
     def __init__(self, session):
-        super().__init__("RapidDNS", session)
+        self.name = "RapidDNS"
+        self.handler = RequestHandler(session)
 
     def _extract_domains_from_page(self, soup):
         domains = set()
@@ -119,8 +91,6 @@ class RapidDNSSource(DomainSource):
 
     def fetch(self, ip):
         domains = set()
-        if cancel_event.is_set():
-            return domains
         try:
             response = self.handler.get(f"https://rapiddns.io/sameip/{ip}")
             if response:
@@ -129,9 +99,10 @@ class RapidDNSSource(DomainSource):
                 total_results = self._get_total_results(soup)
                 if total_results > 100:
                     total_pages = math.ceil(total_results / 100)
-                    for page in range(2, min(total_pages + 1, 3)):  # Limit to 2 extra pages for free tier
-                        if cancel_event.is_set():
-                            break
+                    for page in range(2, min(total_pages + 1, 3)):  # Limit to 2 pages for free tier
+                        if processing_status["cancel_event"] and processing_status["cancel_event"].is_set():
+                            logger.info("Processing cancelled for RapidDNS")
+                            return domains
                         response = self.handler.get(f"https://rapiddns.io/sameip/{ip}?page={page}")
                         if response:
                             soup = BeautifulSoup(response.content, 'html.parser')
@@ -139,34 +110,6 @@ class RapidDNSSource(DomainSource):
         except Exception as e:
             logger.error(f"Error fetching from RapidDNS for IP {ip}: {e}")
         return domains
-
-# YouGetSignal Source
-class YouGetSignalSource(DomainSource):
-    def __init__(self, session):
-        super().__init__("YouGetSignal", session)
-
-    def fetch(self, ip):
-        domains = set()
-        if cancel_event.is_set():
-            return domains
-        try:
-            data = {'remoteAddress': ip, 'key': '', '_': ''}
-            response = self.handler.post("https://domains.yougetsignal.com/domains.php", data=data)
-            if response and response.json().get("status") == "Success":
-                domains.update(
-                    domain[0] for domain in response.json().get("domainArray", [])
-                    if domain and len(domain) > 0
-                )
-        except Exception as e:
-            logger.error(f"Error fetching from YouGetSignal for IP {ip}: {e}")
-        return domains
-
-# Get scrapers
-def get_scrapers(session):
-    return [
-        RapidDNSSource(session),
-        YouGetSignalSource(session)
-    ]
 
 # Process IPs from file content or text
 def process_input(input_data):
@@ -182,7 +125,10 @@ def process_input(input_data):
                 except ValueError:
                     try:
                         network = ipaddress.ip_network(line, strict=False)
-                        ips.extend(str(ip) for ip in network.hosts()[:100])  # Limit to 100 IPs for free tier
+                        if network.num_addresses > 65536:  # Limit large CIDRs for free tier
+                            logger.warning(f"CIDR {line} too large, skipping")
+                            continue
+                        ips.extend(str(ip) for ip in network.hosts())
                     except ValueError:
                         logger.warning(f"Invalid IP or CIDR: {line}")
         return list(set(ips))
@@ -202,7 +148,7 @@ class IPLookup:
             return domains
         except Exception as e:
             logger.error(f"Error fetching from {source.name} for IP {ip}: {e}")
-            return set
+            return set()
 
     def _save_domains_to_buffer(self, domains):
         if domains:
@@ -214,40 +160,32 @@ class IPLookup:
                 return None
         return None
 
-    def process_ip(self, ip, scrapers):
-        if cancel_event.is_set():
-            return set()
+    def process_ip(self, ip, source):
         try:
-            with ThreadPoolExecutor(max_workers=len(scrapers)) as executor:
-                futures = [
-                    executor.submit(self._fetch_from_source, source, ip)
-                    for source in scrapers
-                ]
-                results = []
-                for future in as_completed(futures, timeout=PROCESS_TIMEOUT):
-                    if cancel_event.is_set():
-                        return set()
-                    results.append(future.result())
-            domains = set().union(*results) if results else set()
-            logger.info(f"Processed IP {ip}: {len(domains)} domains found")
+            domains = self._fetch_from_source(source, ip)
             return domains
         except Exception as e:
             logger.error(f"Error processing IP {ip}: {e}")
             return set()
 
     def run(self, ips):
-        global current_process
         if not ips:
             return False, "No valid IPs provided", None
 
         try:
             all_domains = set()
-            scrapers = get_scrapers(self.session)
+            source = RapidDNSSource(self.session)
+            start_time = time.time()
+
             with ThreadPoolExecutor(max_workers=2) as executor:
-                futures = [executor.submit(self.process_ip, ip, scrapers) for ip in ips]
+                futures = [executor.submit(self.process_ip, ip, source) for ip in ips]
                 for future in as_completed(futures, timeout=PROCESS_TIMEOUT):
-                    if cancel_event.is_set():
-                        return False, "Process cancelled", None
+                    if processing_status["cancel_event"] and processing_status["cancel_event"].is_set():
+                        logger.info("Processing cancelled")
+                        return False, "Processing cancelled by user", None
+                    if time.time() - start_time > PROCESS_TIMEOUT:
+                        logger.warning("Process timed out")
+                        return False, "Processing timed out", None
                     try:
                         domains = future.result()
                         all_domains.update(domains)
@@ -272,178 +210,170 @@ class IPLookup:
 # Initialize bot
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
-# Signal handler for graceful shutdown
-def signal_handler(sig, frame):
-    logger.info("Received shutdown signal, stopping bot...")
-    bot.stop_polling()
-    sys.exit(0)
+# Delete webhook before starting polling
+def delete_webhook():
+    try:
+        bot.delete_webhook()
+        logger.info("Webhook deleted successfully")
+    except Exception as e:
+        logger.error(f"Failed to delete webhook: {e}")
 
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-# Command handlers
+# Command: Start
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "👋 Welcome to the IP Lookup Bot! Send an IP, CIDR, or a .txt file with IPs (one per line) to get domains associated with them. Use /cmd to see all commands.")
+    bot.reply_to(message, "👋 Welcome to the IP Lookup Bot! Send an IP, CIDR, or a .txt file with IPs (one per line) to get domains associated with them. Use /cmd for available commands.")
 
+# Command: Commands list
 @bot.message_handler(commands=['cmd'])
 def send_commands(message):
     commands = (
         "/start - Start the bot\n"
         "/cmd - List all commands\n"
-        "/status - Check bot status\n"
-        "/cancel - Cancel current processing"
+        "/status - Check if the bot is processing\n"
+        "/cancel - Cancel the current processing task"
     )
     bot.reply_to(message, f"📜 Available commands:\n{commands}")
 
+# Command: Status
 @bot.message_handler(commands=['status'])
-def send_status(message):
-    global current_process
-    with process_lock:
-        if current_process and current_process.is_alive():
-            bot.reply_to(message, "⏳ Bot is currently processing a request.")
-        else:
-            bot.reply_to(message, "✅ Bot is idle and ready to process requests.")
+def check_status(message):
+    if processing_status["is_running"]:
+        bot.reply_to(message, "⏳ Bot is currently processing a task.")
+    else:
+        bot.reply_to(message, "✅ Bot is idle and ready to process your request.")
 
+# Command: Cancel
 @bot.message_handler(commands=['cancel'])
-def cancel_process(message):
-    global current_process
-    with process_lock:
-        if current_process and current_process.is_alive():
-            cancel_event.set()
-            bot.reply_to(message, "🛑 Current process cancelled.")
+def cancel_processing(message):
+    chat_id = message.chat.id
+    if processing_status["is_running"] and processing_status["chat_id"] == chat_id:
+        if processing_status["cancel_event"]:
+            processing_status["cancel_event"].set()
+            bot.reply_to(message, "🛑 Processing cancelled. Please wait a moment.")
         else:
-            bot.reply_to(message, "ℹ️ No process is currently running.")
+            bot.reply_to(message, "❌ No processing task to cancel.")
+    else:
+        bot.reply_to(message, "❌ No active task for your chat to cancel.")
 
 # Handle text messages (single IP or CIDR)
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
-    global current_process
+    global processing_status
     chat_id = message.chat.id
+
+    if processing_status["is_running"]:
+        bot.reply_to(message, "⏳ Bot is busy with another task. Please wait or use /cancel to stop the current task.")
+        return
+
+    processing_status = {"is_running": True, "chat_id": chat_id, "cancel_event": threading.Event()}
     input_text = message.text.strip()
 
-    with process_lock:
-        if current_process and current_process.is_alive():
-            bot.reply_to(message, "⏳ Another process is running. Please wait or use /cancel to stop it.")
-            return
-
-    cancel_event.clear()  # Reset cancel event
     try:
-        # Validate input
         try:
             ipaddress.ip_address(input_text)
             ips = [input_text]
         except ValueError:
             try:
                 network = ipaddress.ip_network(input_text, strict=False)
-                ips = [str(ip) for ip in network.hosts()[:100]]  # Limit to 100 IPs
+                ips = [str(ip) for ip in network.hosts()]
             except ValueError:
                 bot.reply_to(message, "❌ Invalid IP or CIDR format. Please provide a valid IP or CIDR.")
+                processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
                 return
     except Exception as e:
         bot.reply_to(message, f"❌ Error validating input: {str(e)}")
+        processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
         return
 
-    # Process IPs in a separate thread
-    def process_task():
-        processing_message = bot.send_message(chat_id, "⏳ Processing your input...")
-        iplookup = IPLookup()
-        success, result_message, output_buffer = iplookup.run(ips)
+    processing_message = bot.send_message(chat_id, "⏳ Processing your input...")
+    iplookup = IPLookup()
+    success, result_message, output_buffer = iplookup.run(ips)
 
-        if cancel_event.is_set():
-            bot.edit_message_text("🛑 Process cancelled", chat_id, processing_message.message_id)
-            return
+    if processing_status["cancel_event"].is_set():
+        bot.edit_message_text("🛑 Processing was cancelled.", chat_id, processing_message.message_id)
+        processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
+        return
 
-        if not success:
-            bot.edit_message_text(result_message, chat_id, processing_message.message_id)
-            return
+    if not success:
+        bot.edit_message_text(result_message, chat_id, processing_message.message_id)
+        processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
+        return
 
-        # Send output file
-        bot.edit_message_text(result_message + "\n\n📤 Sending results...", chat_id, processing_message.message_id)
-        output_buffer.seek(0)
-        bot.send_document(
-            chat_id,
-            document=output_buffer,
-            file_name="ip_lookup_results.txt",
-            caption="Domains found (one per line)."
-        )
-
-    with process_lock:
-        current_process = threading.Thread(target=process_task)
-        current_process.start()
+    bot.edit_message_text(result_message + "\n\n📤 Sending results...", chat_id, processing_message.message_id)
+    output_buffer.seek(0)
+    bot.send_document(
+        chat_id,
+        document=output_buffer,
+        file_name="ip_lookup_results.txt",
+        caption="Domains found (one per line)."
+    )
+    processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
 
 # Handle document messages (text file with IPs)
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
-    global current_process
+    global processing_status
     chat_id = message.chat.id
-    file_name = message.document.file_name
 
-    with process_lock:
-        if current_process and current_process.is_alive():
-            bot.reply_to(message, "⏳ Another process is running. Please wait or use /cancel to stop it.")
-            return
+    if processing_status["is_running"]:
+        bot.reply_to(message, "⏳ Bot is busy with another task. Please wait or use /cancel to stop the current task.")
+        return
+
+    processing_status = {"is_running": True, "chat_id": chat_id, "cancel_event": threading.Event()}
+    file_name = message.document.file_name
 
     if not file_name.endswith('.txt'):
         bot.reply_to(message, "❌ Please upload a .txt file containing IPs or CIDRs.")
+        processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
         return
 
-    cancel_event.clear()  # Reset cancel event
     try:
-        # Download file
         file_info = bot.get_file(message.document.file_id)
         file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_info.file_path}"
         response = requests.get(file_url, timeout=10)
         response.raise_for_status()
 
-        # Process file content
         processing_message = bot.send_message(chat_id, f"⏳ Processing {file_name}...")
         ips = process_input(response.content)
         if not ips:
             bot.edit_message_text(f"❌ No valid IPs or CIDRs found in {file_name}.", chat_id, processing_message.message_id)
+            processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
             return
 
-        # Process IPs in a separate thread
-        def process_task():
-            iplookup = IPLookup()
-            success, result_message, output_buffer = iplookup.run(ips)
+        iplookup = IPLookup()
+        success, result_message, output_buffer = iplookup.run(ips)
 
-            if cancel_event.is_set():
-                bot.edit_message_text("🛑 Process cancelled", chat_id, processing_message.message_id)
-                return
+        if processing_status["cancel_event"].is_set():
+            bot.edit_message_text("🛑 Processing was cancelled.", chat_id, processing_message.message_id)
+            processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
+            return
 
-            if not success:
-                bot.edit_message_text(result_message, chat_id, processing_message.message_id)
-                return
+        if not success:
+            bot.edit_message_text(result_message, chat_id, processing_message.message_id)
+            processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
+            return
 
-            # Send output file
-            bot.edit_message_text(result_message + f"\n\n📤 Sending results for {file_name}...", chat_id, processing_message.message_id)
-            output_buffer.seek(0)
-            bot.send_document(
-                chat_id,
-                document=output_buffer,
-                file_name=f"ip_lookup_results_{file_name}",
-                caption=f"Domains found for {file_name} (one per line)."
-            )
-
-        with process_lock:
-            current_process = threading.Thread(target=process_task)
-            current_process.start()
+        bot.edit_message_text(result_message + f"\n\n📤 Sending results for {file_name}...", chat_id, processing_message.message_id)
+        output_buffer.seek(0)
+        bot.send_document(
+            chat_id,
+            document=output_buffer,
+            file_name=f"ip_lookup_results_{file_name}",
+            caption=f"Domains found for {file_name} (one per line)."
+        )
+        processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
 
     except Exception as e:
         logger.error(f"Error processing {file_name}: {e}")
         bot.edit_message_text(f"❌ Failed to process {file_name}: {str(e)}", chat_id, processing_message.message_id)
+        processing_status = {"is_running": False, "chat_id": None, "cancel_event": None}
 
-# Delete webhook and start polling
-def main():
+if __name__ == "__main__":
     try:
-        bot.delete_webhook()
-        logger.info("Webhook deleted successfully")
-        bot.infinity_polling(timeout=20, long_polling_timeout=20)
+        delete_webhook()
+        logger.info("Starting bot polling...")
+        bot.polling(none_stop=True, interval=0, timeout=20)
     except Exception as e:
         logger.error(f"Bot polling error: {e}")
         time.sleep(5)
-        main()
-
-if __name__ == "__main__":
-    main()
+        bot.polling(none_stop=True, interval=0, timeout=20)
